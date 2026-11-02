@@ -1,0 +1,390 @@
+--[[ universal.lua — silent aim + esp + chams + visuals
+     Нужен исполнитель с: Drawing, mousemoverel (или mousemoveabs), game.HttpGet опционально.
+     Бинды:
+       Q     — вкл/выкл AIM (silent)
+       RMB   — удержание — прицел
+       F1    — вкл/выкл ESP
+       F2    — вкл/выкл CHAMS
+       F3    — вкл/выкл FOV-круг
+       F4    — ре-инициализация кэша
+]]
+
+-- ============================ SERVICES ============================
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UIS          = game:GetService("UserInputService")
+local Workspace    = game:GetService("Workspace")
+local CoreGui      = pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui") or nil
+
+local LP     = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- ============================ CONFIG ==============================
+local CFG = {
+    esp = {
+        enabled    = true,
+        box        = true,
+        name       = true,
+        health     = true,
+        distance   = true,
+        tracer     = false,
+        teamCheck  = true,
+        maxDist    = 1500,
+        color      = Color3.fromRGB(255, 60, 60),
+        fillBox    = false,
+        fillAlpha  = 0.15,
+    },
+    chams = {
+        enabled     = true,
+        fill        = Color3.fromRGB(255, 0, 0),
+        outline     = Color3.fromRGB(255, 255, 255),
+        transparency= 0.55,
+        depthAlways = true,
+    },
+    aim = {
+        enabled   = true,
+        silent    = true,
+        fov       = 140,        -- радиус в пикселях
+        smooth    = 0.35,       -- 1 = мгновенно
+        part      = "Head",
+        wallCheck = true,
+        holdMode  = true,       -- true: держишь RMB, false: только по Q
+        toggleKey = Enum.KeyCode.Q,
+    },
+    visual = {
+        fovCircle  = true,
+        fovColor   = Color3.fromRGB(255, 255, 255),
+        crosshair  = false,
+    },
+}
+
+-- ============================ STATE ===============================
+local Cache     = {}    -- [Player] = { drawing..., hl=Highlight }
+local AimTarget = nil
+local AimOn     = CFG.aim.enabled
+local EspOn     = CFG.esp.enabled
+local ChamsOn   = CFG.chams.enabled
+local FovOn     = CFG.visual.fovCircle
+
+-- ============================ HELPERS =============================
+local function newDrawing(class, props)
+    local ok, obj = pcall(function() return Drawing.new(class) end)
+    if not ok or not obj then return nil end
+    for k, v in pairs(props or {}) do obj[k] = v end
+    return obj
+end
+
+local function worldToScreen(pos)
+    local sp, onScreen = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(sp.X, sp.Y), onScreen and sp.Z > 0, sp.Z
+end
+
+local function getChar(plr)
+    local ch = plr.Character
+    if not ch then return end
+    local hum  = ch:FindFirstChildOfClass("Humanoid")
+    local hrp  = ch:FindFirstChild("HumanoidRootPart")
+    local head = ch:FindFirstChild("Head")
+    if not (hum and hrp and head) then return end
+    if hum.Health <= 0 then return end
+    return ch, hum, hrp, head
+end
+
+local function isEnemy(plr)
+    if plr == LP then return false end
+    if CFG.esp.teamCheck and LP.Team and plr.Team and plr.Team == LP.Team then
+        return false
+    end
+    return true
+end
+
+local function hasLOS(part)
+    if not CFG.aim.wallCheck then return true end
+    local origin = Camera.CFrame.Position
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LP.Character, Camera }
+    local res = Workspace:Raycast(origin, part.Position - origin, params)
+    return res == nil or res.Instance:IsDescendantOf(part.Parent)
+end
+
+local function distTo(plr)
+    local ch = plr.Character
+    if not ch or not ch:FindFirstChild("HumanoidRootPart") then return math.huge end
+    local p = ch.HumanoidRootPart.Position
+    if LP.Character and LP.Character:FindFirstChild("HumanoidRootPart") then
+        return (p - LP.Character.HumanoidRootPart.Position).Magnitude
+    end
+    return (p - Camera.CFrame.Position).Magnitude
+end
+
+-- ============================ ESP OBJECTS =========================
+local function buildEsp(plr)
+    local e = {}
+    e.box       = newDrawing("Square", { Thickness = 1, Filled = false })
+    e.boxFill   = newDrawing("Square", { Thickness = 0, Filled = true })
+    e.name      = newDrawing("Text",   { Size = 14, Center = true, Outline = true, OutlineColor = Color3.new(0,0,0) })
+    e.dist      = newDrawing("Text",   { Size = 13, Center = true, Outline = true, OutlineColor = Color3.new(0,0,0) })
+    e.hpBack    = newDrawing("Square", { Thickness = 0, Filled = true, Color = Color3.fromRGB(20,20,20) })
+    e.hpFill    = newDrawing("Square", { Thickness = 0, Filled = true, Color = Color3.fromRGB(0,255,120) })
+    e.tracer    = newDrawing("Line",   { Thickness = 1 })
+    Cache[plr] = Cache[plr] or {}
+    for k, v in pairs(e) do Cache[plr][k] = v end
+    return Cache[plr]
+end
+
+local function destroyEsp(plr)
+    local e = Cache[plr]
+    if not e then return end
+    for k, v in pairs(e) do
+        if typeof(v) == "table" and v.Remove then pcall(v.Remove, v) end
+        if typeof(v) == "userdata" and v.Remove then pcall(v.Remove, v) end
+    end
+    Cache[plr] = nil
+end
+
+-- ============================ CHAMS ===============================
+local function updateChams(plr, ch)
+    local e = Cache[plr]
+    if not e then return end
+    if not ChamsOn then
+        if e.hl then e.hl:Destroy(); e.hl = nil end
+        return
+    end
+    if e.hl and e.hl.Adornee ~= ch then
+        pcall(function() e.hl:Destroy() end)
+        e.hl = nil
+    end
+    if not e.hl then
+        local h = Instance.new("Highlight")
+        h.Name = "esp_visual"
+        h.FillColor = CFG.chams.fill
+        h.OutlineColor = CFG.chams.outline
+        h.FillTransparency = CFG.chams.transparency
+        h.OutlineTransparency = 0
+        h.DepthMode = CFG.chams.depthAlways
+            and Enum.HighlightDepthMode.AlwaysOnTop
+            or  Enum.HighlightDepthMode.Occluded
+        h.Adornee = ch
+        h.Parent = ch
+        e.hl = h
+    end
+end
+
+-- ============================ ESP UPDATE ==========================
+local function updateEsp(plr)
+    if plr == LP then return end
+    local e = Cache[plr]
+    if not e then return end
+
+    local ch, hum, hrp, head = getChar(plr)
+    local hide = true
+
+    if ch and EspOn and isEnemy(plr) and distTo(plr) <= CFG.esp.maxDist then
+        local top    = head.Position + Vector3.new(0, 0.6, 0)
+        local bottom = hrp.Position  - Vector3.new(0, 2.8, 0)
+        local st, visTop = worldToScreen(top)
+        local sb, visBot = worldToScreen(bottom)
+
+        if visTop and visBot then
+            hide = false
+            local h = math.abs(sb.Y - st.Y)
+            local w = h * 0.55
+            local x = st.X - w / 2
+            local y = st.Y
+
+            e.box.Visible     = CFG.esp.box
+            e.box.Color       = CFG.esp.color
+            e.box.Position    = Vector2.new(x, y)
+            e.box.Size        = Vector2.new(w, h)
+
+            e.boxFill.Visible = CFG.esp.fillBox and CFG.esp.box
+            e.boxFill.Color   = CFG.esp.color
+            e.boxFill.Transparency = 1 - CFG.esp.fillAlpha
+            e.boxFill.Position= Vector2.new(x, y)
+            e.boxFill.Size    = Vector2.new(w, h)
+
+            e.name.Visible    = CFG.esp.name
+            e.name.Color      = CFG.esp.color
+            e.name.Position   = Vector2.new(st.X, y - 18)
+            e.name.Text       = plr.Name
+
+            e.dist.Visible    = CFG.esp.distance
+            e.dist.Color      = CFG.esp.color
+            e.dist.Position   = Vector2.new(st.X, y + h + 4)
+            e.dist.Text       = string.format("%d m", math.floor(distTo(plr) / 3))
+
+            local hp = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+            e.hpBack.Visible  = CFG.esp.health
+            e.hpBack.Position = Vector2.new(x - 6, y)
+            e.hpBack.Size     = Vector2.new(3, h)
+
+            e.hpFill.Visible  = CFG.esp.health
+            e.hpFill.Color    = Color3.fromRGB(255 * (1 - hp), 255 * hp, 0)
+            e.hpFill.Position = Vector2.new(x - 6, y + h * (1 - hp))
+            e.hpFill.Size     = Vector2.new(3, h * hp)
+
+            if CFG.esp.tracer then
+                e.tracer.Visible = true
+                e.tracer.Color   = CFG.esp.color
+                e.tracer.From    = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                e.tracer.To      = Vector2.new(st.X, y + h)
+            else
+                e.tracer.Visible = false
+            end
+        end
+    end
+
+    if hide then
+        for _, obj in pairs(e) do
+            if typeof(obj) == "table" and obj.Visible ~= nil then obj.Visible = false end
+            if typeof(obj) == "userdata" and obj.Visible ~= nil then obj.Visible = false end
+        end
+    end
+
+    updateChams(plr, ch)
+end
+
+-- ============================ AIM =================================
+local function pickTarget()
+    local best, bestD = nil, CFG.aim.fov
+    local center = Camera.ViewportSize / 2
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isEnemy(plr) then
+            local ch, hum, hrp, head = getChar(plr)
+            if ch and distTo(plr) <= CFG.esp.maxDist then
+                local part = ch:FindFirstChild(CFG.aim.part) or head
+                local sp, onScreen = worldToScreen(part.Position)
+                if onScreen and hasLOS(part) then
+                    local d = (Vector2.new(sp.X - center.X, sp.Y - center.Y)).Magnitude
+                    if d < bestD then
+                        bestD = d
+                        best  = part
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function moveMouse(dx, dy)
+    if mousemoverel then
+        pcall(mousemoverel, math.floor(dx), math.floor(dy))
+        return true
+    elseif mousemoveabs then
+        local m = UIS:GetMouseLocation()
+        pcall(mousemoveabs, math.floor(m.X + dx), math.floor(m.Y + dy))
+        return true
+    end
+    return false
+end
+
+local function doAim()
+    if not (AimOn and (not CFG.aim.holdMode or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))) then
+        AimTarget = nil
+        return
+    end
+    local part = pickTarget()
+    AimTarget = part
+    if not part then return end
+
+    local sp, onScreen = worldToScreen(part.Position)
+    if not onScreen then return end
+
+    local center = Camera.ViewportSize / 2
+    local dx = (sp.X - center.X) * CFG.aim.smooth
+    local dy = (sp.Y - center.Y) * CFG.aim.smooth
+
+    if CFG.aim.silent then
+        if not moveMouse(dx, dy) then
+            -- fallback: мягкий поворот камеры
+            local goal = CFrame.new(Camera.CFrame.Position, part.Position)
+            Camera.CFrame = Camera.CFrame:Lerp(goal, math.clamp(CFG.aim.smooth, 0.02, 1))
+        end
+    else
+        local goal = CFrame.new(Camera.CFrame.Position, part.Position)
+        Camera.CFrame = Camera.CFrame:Lerp(goal, math.clamp(CFG.aim.smooth, 0.02, 1))
+    end
+end
+
+-- ============================ VISUALS =============================
+local FovCircle = newDrawing("Circle", {
+    Thickness = 1,
+    Filled    = false,
+    NumSides  = 64,
+    Color     = CFG.visual.fovColor,
+    Visible   = FovOn,
+})
+
+local Crosshair = newDrawing("Line", { Thickness = 1, Transparenty = 0, Visible = false })
+
+local function updateVisuals()
+    local center = Camera.ViewportSize / 2
+    if FovCircle then
+        FovCircle.Visible  = FovOn
+        FovCircle.Position = center
+        FovCircle.Radius   = CFG.aim.fov
+        FovCircle.Color    = AimTarget and Color3.fromRGB(0, 255, 120) or CFG.visual.fovColor
+    end
+end
+
+-- ============================ BINDS ===============================
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == CFG.aim.toggleKey then
+        AimOn = not AimOn
+    elseif input.KeyCode == Enum.KeyCode.F1 then
+        EspOn = not EspOn
+    elseif input.KeyCode == Enum.KeyCode.F2 then
+        ChamsOn = not ChamsOn
+    elseif input.KeyCode == Enum.KeyCode.F3 then
+        FovOn = not FovOn
+    elseif input.KeyCode == Enum.KeyCode.F4 then
+        for plr in pairs(Cache) do destroyEsp(plr) end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LP then buildEsp(plr) end
+        end
+    end
+end)
+
+-- ============================ LIFECYCLE ===========================
+local function onPlayerAdded(plr)
+    if plr == LP then return end
+    buildEsp(plr)
+end
+
+local function onPlayerRemoving(plr)
+    destroyEsp(plr)
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do onPlayerAdded(plr) end
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    Camera = Workspace.CurrentCamera
+end)
+
+-- ============================ LOOP ================================
+RunService.RenderStepped:Connect(function()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local ok, err = pcall(updateEsp, plr)
+            if not ok then destroyEsp(plr); buildEsp(plr) end
+        end
+    end
+    pcall(updateVisuals)
+    pcall(doAim)
+end)
+
+-- ============================ CLEANUP =============================
+local function cleanup()
+    for plr in pairs(Cache) do destroyEsp(plr) end
+    if FovCircle then pcall(FovCircle.Remove, FovCircle) end
+    if Crosshair and Crosshair.Remove then pcall(Crosshair.Remove, Crosshair) end
+end
+
+LP.AncestryChanged:Connect(function(_, parent)
+    if not parent then cleanup() end
+end)
